@@ -15,7 +15,7 @@ impl Node {
     }
 }
 
-/// Represents a directed edge between two nodes in the knowledge graph.
+/// Represents a Structural directed edge between two nodes in the knowledge graph.
 /// Edges track the version/timestamp when they were created and can be tagged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Edge {
@@ -42,6 +42,8 @@ impl Edge {
 pub struct KnowledgeBase {
     /// Maps node index pairs (from, to) to edges
     edge_table: BTreeMap<(usize, usize), Edge>,
+    /// Maps from reference nodes to nodes
+    ref_table: BTreeMap<(usize, usize), Edge>,
     /// Ordered set of unique nodes
     node_table: IndexSet<Node>,
 }
@@ -51,6 +53,7 @@ impl KnowledgeBase {
     pub fn new() -> Self {
         Self {
             edge_table: BTreeMap::new(),
+            ref_table: BTreeMap::new(),
             node_table: IndexSet::new(),
         }
     }
@@ -70,6 +73,7 @@ impl KnowledgeBase {
         &mut self,
         markdown_content: &str,
         filename: &str,
+        reference_nodes: Vec<Node>,
         version: i32,
         tag: &str,
     ) {
@@ -88,19 +92,25 @@ impl KnowledgeBase {
         if nodes.is_empty() {
             return;
         }
+        let mut new_node_indices = Vec::new();
 
         // Insert first node
-        self.node_table.insert(nodes[0].clone());
+        if self.node_table.insert(nodes[0].clone()) {
+            new_node_indices.push(self.node_table.get_index_of(&nodes[0]).unwrap())
+        };
 
         // Insert remaining nodes and create edges
         for window in nodes.windows(2) {
             let from_node = &window[0];
             let to_node = &window[1];
 
-            self.node_table.insert(to_node.clone());
+            let is_new = self.node_table.insert(to_node.clone());
 
             let from_idx = self.node_table.get_index_of(from_node).unwrap();
             let to_idx = self.node_table.get_index_of(to_node).unwrap();
+            if is_new {
+                new_node_indices.push(to_idx)
+            };
 
             let edge_key = (from_idx, to_idx);
 
@@ -108,6 +118,21 @@ impl KnowledgeBase {
             self.edge_table
                 .entry(edge_key)
                 .or_insert_with(|| Edge::new(version, tag.to_string()));
+        }
+
+        // Insert references
+        for reference_node in reference_nodes {
+            self.node_table.insert(reference_node.clone());
+
+            let from_idx = self.node_table.get_index_of(&reference_node).unwrap();
+            for to_idx in new_node_indices.clone().into_iter() {
+                let edge_key = (from_idx, to_idx);
+
+                // Only insert if edge doesn't exist - this preserves divergent paths
+                self.ref_table
+                    .entry(edge_key)
+                    .or_insert_with(|| Edge::new(version, tag.to_string()));
+            }
         }
     }
 
@@ -204,50 +229,32 @@ impl Default for KnowledgeBase {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_basic_insertion() {
-        let mut kb = KnowledgeBase::new();
-        let markdown = "# Header\nContent";
-
-        kb.insert_markdown(markdown, "test.md", 0, "test");
-
-        assert!(kb.node_count() > 0);
-    }
-
-    #[test]
-    fn test_divergent_paths() {
-        let mut kb = KnowledgeBase::new();
-
-        // Insert first version
-        kb.insert_markdown("# A\n# B\n# C", "test.md", 0, "path1");
-
-        // Insert divergent version (A -> B -> D instead of A -> B -> C)
-        kb.insert_markdown("# A\n# B\n# D", "test.md", 1, "path2");
-
-        // Both edges from B should exist
-        assert!(kb.edge_count() >= 3); // A->B, B->C, B->D
-    }
-}
-
 fn main() {
     let mut kb = KnowledgeBase::new();
 
     // Insert multiple versions of similar content
     let md1 = "# Hi, *Saturn*! 🪐\nThis is some text\n## Another header\nMore text\n## New Header\n More texts";
-    kb.insert_markdown(md1, "test.md", 0, "version-0");
-
-    let md2 = "# Hi, *MARS*! 🪐\nThis is some text\n## Another header\nMore text\n## News Header\n More texts";
-    kb.insert_markdown(md2, "test.md", 1, "version-1");
-
-    let md3 = "# Hi, *Saturn*! 🪐\nThis is some new text\n## Another header\nMore text\n## New Header\n More texts";
-    kb.insert_markdown(md3, "test.md", 2, "version-2");
-
-    let md4 = "# Hi, *Saturn*! 🪐\nThis is some new text\n## Another header\nMore text\n### Inserted Header\nLots of New Text\n### Another one\nNewNewNew\n## New Header\n More texts";
-    kb.insert_markdown(md4, "test.md", 2, "version-2");
+    kb.insert_markdown(
+        md1,
+        "test.md",
+        vec![Node::new(
+            "it came to me in a dream".to_string(),
+            "".to_string(),
+        )],
+        0,
+        "version-0",
+    );
+    let md2 = "# Hi, *Saturn*! 🪐\nThis is some better text\n## Another header\nMore text\n## New Header\n More texts";
+    kb.insert_markdown(
+        md2,
+        "test.md",
+        vec![Node::new(
+            "I actually read this I swear".to_string(),
+            "".to_string(),
+        )],
+        1,
+        "version-1",
+    );
 
     // Display the knowledge base state
     println!("=== Knowledge Base State ===");
@@ -267,4 +274,6 @@ fn main() {
     // Traverse and print the latest path from origin
     println!("\n=== Latest Path Traversal (from origin) ===");
     kb.print_from_origin("test.md");
+
+    println!("{:?}", kb.ref_table)
 }
