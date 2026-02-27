@@ -26,6 +26,38 @@ LiasionDB uses a single **`.ledger`** file to track what you've read:
 
 The `.ledger` file is shared across the session - it accumulates all reads until you clear it.
 
+## Workspaces (File Organization Only)
+
+**IMPORTANT:** The database itself is universal and shared. All reads and writes go to the same graph database.
+
+The `workspace` query parameter ONLY affects:
+- Where files are saved on disk when you download them
+- Which `.ledger` file tracks what you've read
+
+This allows multiple concurrent sessions to:
+- All read/write to the same universal database
+- But maintain separate "reading contexts" via different ledger files
+- Download files to different directories to avoid conflicts
+
+**Example:**
+```bash
+# Session 1 - downloads to default location
+curl http://127.0.0.1:3000/files/doc.md
+
+# Session 2 - downloads to "alice" subdirectory with its own ledger
+curl "http://127.0.0.1:3000/files/doc.md?workspace=alice"
+
+# Session 3 - downloads to "bob" subdirectory with its own ledger
+curl "http://127.0.0.1:3000/files/doc.md?workspace=bob"
+```
+
+All three sessions read from the **same database**, but:
+- Default: Files saved to `{FILE_DIR}/doc.md`, ledger at `{FILE_DIR}/.ledger`
+- Alice: Files saved to `{FILE_DIR}/alice/doc.md`, ledger at `{FILE_DIR}/alice/.ledger`
+- Bob: Files saved to `{FILE_DIR}/bob/doc.md`, ledger at `{FILE_DIR}/bob/.ledger`
+
+When Alice writes a file, it uses her ledger's node IDs as references, but writes to the shared database.
+
 ## API Endpoints
 
 ### 1. Health Check
@@ -66,26 +98,31 @@ curl http://127.0.0.1:3000/files
 
 ### 3. Read File
 
-**GET** `/files/{filepath}`
+**GET** `/files/{filepath}?workspace={workspace}`
 
 Reads a file from the knowledge base and:
-- Saves it to `{FILE_DIR}/{filepath}`
-- **Appends** the node IDs to `{FILE_DIR}/.ledger`
+- Saves it to `{FILE_DIR}/{workspace}/{filepath}` (or `{FILE_DIR}/{filepath}` if no workspace)
+- **Appends** the node IDs to the workspace's `.ledger` file
+
+**Query Parameters:**
+- `workspace` (optional): Workspace name for isolation. Default is no workspace.
 
 **Response:**
 - Content-Type: text/plain
-- Body: The file content (HTML representation of the markdown)
+- Body: The file content in markdown format
 
 **Side Effects:**
-- Creates/overwrites `{FILE_DIR}/{filepath}` with the file content
-- **Appends** node IDs to `{FILE_DIR}/.ledger` (creates if doesn't exist)
+- Creates/overwrites the file in the workspace directory
+- **Appends** node IDs to workspace's `.ledger` (creates if doesn't exist)
 
-**Example:**
+**Examples:**
 ```bash
+# Default workspace
 curl http://127.0.0.1:3000/files/example.md
-```
 
-This saves to `./files/example.md` and appends node IDs to `./files/.ledger`
+# "session1" workspace
+curl "http://127.0.0.1:3000/files/example.md?workspace=session1"
+```
 
 ---
 
@@ -111,15 +148,21 @@ Writes a file to the knowledge base. All node IDs in `.ledger` are used as refer
 ```
 
 **How it Works:**
-1. Reads `{FILE_DIR}/.ledger` to get all previously read node IDs
+1. Reads the workspace's `.ledger` to get all previously read node IDs
 2. Converts those node IDs back to Node objects
 3. Creates a file node linked to the appropriate directory
-4. Converts markdown to HTML and creates content nodes
+4. Splits markdown by lines and creates content nodes
 5. Links all new content nodes to the reference nodes in the `ref_table`
 
-**Example:**
+**Examples:**
 ```bash
+# Default workspace
 curl -X POST http://127.0.0.1:3000/files/my-doc.md \
+  -H "Content-Type: application/json" \
+  -d '{"content": "# Hello World\n\nThis is my document."}'
+
+# "session1" workspace
+curl -X POST "http://127.0.0.1:3000/files/my-doc.md?workspace=session1" \
   -H "Content-Type: application/json" \
   -d '{"content": "# Hello World\n\nThis is my document."}'
 ```
@@ -128,22 +171,30 @@ curl -X POST http://127.0.0.1:3000/files/my-doc.md \
 
 ### 5. Clear Ledger
 
-**DELETE** `/ledger`
+**DELETE** `/ledger?workspace={workspace}`
 
-Clears the `.ledger` file, removing all tracked node IDs.
+Clears the workspace's `.ledger` file, removing all tracked node IDs.
+
+**Query Parameters:**
+- `workspace` (optional): Workspace name. Default is no workspace.
 
 Use this when you want to start a fresh provenance tracking session.
 
 **Response:**
 ```json
 {
-  "status": "ledger cleared"
+  "status": "ledger cleared",
+  "workspace": "default"
 }
 ```
 
-**Example:**
+**Examples:**
 ```bash
+# Clear default workspace ledger
 curl -X DELETE http://127.0.0.1:3000/ledger
+
+# Clear "session1" workspace ledger
+curl -X DELETE "http://127.0.0.1:3000/ledger?workspace=session1"
 ```
 
 ---
@@ -265,3 +316,26 @@ Think of it like this:
 - Every file you read gets added to the list
 - Every file you write gets linked to everything on the list
 - Clear the list when you want to start a new context
+
+**Using workspaces for concurrent sessions:**
+
+Use different workspace names to organize file downloads and maintain separate reading contexts:
+
+```bash
+# Session A - frontend developer
+curl "http://127.0.0.1:3000/files/components.md?workspace=frontend" > /dev/null
+curl -X POST "http://127.0.0.1:3000/files/Button.tsx?workspace=frontend" \
+  -H "Content-Type: application/json" \
+  -d '{"content": "# Button Component\n\nImplementing based on components.md"}'
+
+# Session B - backend developer (reading different files, separate ledger)
+curl "http://127.0.0.1:3000/files/api-design.md?workspace=backend" > /dev/null
+curl -X POST "http://127.0.0.1:3000/files/routes.ts?workspace=backend" \
+  -H "Content-Type: application/json" \
+  -d '{"content": "# API Routes\n\nImplementing based on api-design.md"}'
+```
+
+The workspace parameter only:
+- Saves downloaded files to different directories (avoiding conflicts)
+- Tracks separate "reading contexts" via different `.ledger` files
+

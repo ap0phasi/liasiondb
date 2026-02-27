@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get},
     Json, Router,
@@ -407,8 +407,21 @@ async fn health() -> &'static str {
 }
 
 /// Clear the ledger file
-async fn clear_ledger(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let ledger_path = format!("{}/.ledger", state.file_dir);
+async fn clear_ledger(
+    State(state): State<AppState>,
+    Query(params): Query<WorkspaceQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Determine workspace directory
+    let workspace_dir = if params.workspace.is_empty() {
+        state.file_dir.clone()
+    } else {
+        format!("{}/{}", state.file_dir, params.workspace)
+    };
+    
+    let ledger_path = format!("{}/.ledger", workspace_dir);
+    
+    // Ensure workspace directory exists
+    fs::create_dir_all(&workspace_dir).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // Write empty ledger
     let ledger = Ledger::new();
@@ -416,8 +429,16 @@ async fn clear_ledger(State(state): State<AppState>) -> Result<Json<serde_json::
     fs::write(&ledger_path, ledger_json).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     Ok(Json(serde_json::json!({
-        "status": "ledger cleared"
+        "status": "ledger cleared",
+        "workspace": if params.workspace.is_empty() { "default" } else { &params.workspace }
     })))
+}
+
+/// Query parameters for workspace selection
+#[derive(Deserialize)]
+struct WorkspaceQuery {
+    #[serde(default)]
+    workspace: String,
 }
 
 /// Lists all files in the knowledge base
@@ -430,6 +451,7 @@ async fn list_files(State(state): State<AppState>) -> Json<Vec<String>> {
 async fn read_file(
     State(state): State<AppState>,
     Path(filepath): Path<String>,
+    Query(params): Query<WorkspaceQuery>,
 ) -> Result<String, StatusCode> {
     let content: String;
     let node_indices: Vec<usize>;
@@ -445,8 +467,15 @@ async fn read_file(
         }
     }
 
+    // Determine workspace directory
+    let workspace_dir = if params.workspace.is_empty() {
+        state.file_dir.clone()
+    } else {
+        format!("{}/{}", state.file_dir, params.workspace)
+    };
+    
     // Save file to disk
-    let file_path = format!("{}/{}", state.file_dir, filepath);
+    let file_path = format!("{}/{}", workspace_dir, filepath);
     
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&file_path).parent() {
@@ -455,8 +484,8 @@ async fn read_file(
     
     fs::write(&file_path, &content).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Update the shared .ledger file
-    let ledger_path = format!("{}/.ledger", state.file_dir);
+    // Update the workspace-specific .ledger file
+    let ledger_path = format!("{}/.ledger", workspace_dir);
     let mut ledger = if let Ok(ledger_content) = fs::read_to_string(&ledger_path).await {
         serde_json::from_str::<Ledger>(&ledger_content).unwrap_or_else(|_| Ledger::new())
     } else {
@@ -481,10 +510,18 @@ struct WriteFileRequest {
 async fn write_file(
     State(state): State<AppState>,
     Path(filepath): Path<String>,
+    Query(params): Query<WorkspaceQuery>,
     Json(payload): Json<WriteFileRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Read the shared .ledger file to get reference nodes
-    let ledger_path = format!("{}/.ledger", state.file_dir);
+    // Determine workspace directory
+    let workspace_dir = if params.workspace.is_empty() {
+        state.file_dir.clone()
+    } else {
+        format!("{}/{}", state.file_dir, params.workspace)
+    };
+    
+    // Read the workspace-specific .ledger file to get reference nodes
+    let ledger_path = format!("{}/.ledger", workspace_dir);
     let reference_nodes = if let Ok(ledger_content) = fs::read_to_string(&ledger_path).await {
         match serde_json::from_str::<Ledger>(&ledger_content) {
             Ok(ledger) => {
