@@ -129,8 +129,8 @@ impl KnowledgeBase {
 
     /// Inserts markdown content into the knowledge base.
     ///
-    /// The markdown is converted to HTML and split by newlines. Each line becomes
-    /// a node, and sequential nodes are connected by edges with the given version.
+    /// The markdown is split by newlines. Each line becomes a node, and sequential 
+    /// nodes are connected by edges with the given version.
     /// A file node is created and linked to the parent node, then all content nodes
     /// are linked sequentially starting from the file node.
     ///
@@ -156,14 +156,14 @@ impl KnowledgeBase {
         let file_node = Node::new(format!("FILE: {}", filename), filename.to_string());
         self.node_table.insert(file_node.clone());
         let file_idx = self.node_table.get_index_of(&file_node).unwrap();
-
+        
         // Create structural edge from parent to file
         self.edge_table
             .entry((parent_idx, file_idx))
             .or_insert_with(|| Edge::new(version, tag.to_string()));
 
-        let html = markdown::to_html(markdown_content);
-        let content_nodes: Vec<Node> = html
+        // Split markdown by lines and create nodes
+        let content_nodes: Vec<Node> = markdown_content
             .split('\n')
             .filter(|line| !line.is_empty())
             .map(|line| Node::new(line.to_string(), filename.to_string()))
@@ -379,14 +379,13 @@ impl KnowledgeBase {
         
         for idx in path.iter().skip(1) {
             if let Some(node) = self.node_table.get_index(*idx) {
-                // Convert HTML back to a simpler representation
-                // For now, we'll just strip HTML tags as a simple approach
                 let content = &node.content;
                 markdown_parts.push(content.clone());
                 node_indices.push(*idx);
             }
         }
 
+        // Join markdown lines back together
         let markdown = markdown_parts.join("\n");
         Some((markdown, node_indices))
     }
