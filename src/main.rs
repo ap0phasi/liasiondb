@@ -1,5 +1,15 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get},
+    Json, Router,
+};
 use indexmap::IndexSet;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+use tokio::fs;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Represents a content node in the knowledge graph.
 /// Nodes are uniquely identified by their content and source filename.
@@ -29,6 +39,38 @@ impl Edge {
     pub fn new(version: i32, tag: String) -> Self {
         Self { version, tag }
     }
+}
+
+/// Ledger file that tracks which nodes have been read.
+/// This is a single .ledger file that accumulates node IDs as files are read.
+/// When writing, these nodes are used as references.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Ledger {
+    /// Node indices that have been read
+    pub node_indices: Vec<usize>,
+}
+
+impl Ledger {
+    pub fn new() -> Self {
+        Self {
+            node_indices: Vec::new(),
+        }
+    }
+
+    pub fn add_nodes(&mut self, nodes: Vec<usize>) {
+        self.node_indices.extend(nodes);
+        // Remove duplicates while preserving order
+        let mut seen = std::collections::HashSet::new();
+        self.node_indices.retain(|&x| seen.insert(x));
+    }
+}
+
+/// Shared application state
+#[derive(Clone)]
+pub struct AppState {
+    kb: Arc<RwLock<KnowledgeBase>>,
+    /// Directory where files are saved/loaded
+    file_dir: String,
 }
 
 /// A graph-based CRDT for tracking provenance and relationships in a knowledge base.
@@ -307,6 +349,47 @@ impl KnowledgeBase {
     pub fn edge_count(&self) -> usize {
         self.edge_table.len()
     }
+
+    /// Lists all unique filenames in the knowledge base.
+    pub fn list_files(&self) -> Vec<String> {
+        let mut files: Vec<String> = self
+            .node_table
+            .iter()
+            .filter(|node| node.content.starts_with("FILE: "))
+            .map(|node| node.content.strip_prefix("FILE: ").unwrap().to_string())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    /// Reconstructs a markdown file from the knowledge base by traversing from a file node.
+    /// Returns both the markdown content and the node indices that composed it.
+    pub fn read_file(&self, filename: &str) -> Option<(String, Vec<usize>)> {
+        // Find the file node
+        let file_node = Node::new(format!("FILE: {}", filename), filename.to_string());
+        let file_idx = self.node_table.get_index_of(&file_node)?;
+
+        // Traverse from the file node to get all content
+        let path = self.traverse_latest_path(file_idx);
+        
+        // Skip the first node (FILE node itself) and collect content
+        let mut node_indices = Vec::new();
+        let mut markdown_parts = Vec::new();
+        
+        for idx in path.iter().skip(1) {
+            if let Some(node) = self.node_table.get_index(*idx) {
+                // Convert HTML back to a simpler representation
+                // For now, we'll just strip HTML tags as a simple approach
+                let content = &node.content;
+                markdown_parts.push(content.clone());
+                node_indices.push(*idx);
+            }
+        }
+
+        let markdown = markdown_parts.join("\n");
+        Some((markdown, node_indices))
+    }
 }
 
 impl Default for KnowledgeBase {
@@ -315,7 +398,214 @@ impl Default for KnowledgeBase {
     }
 }
 
-fn main() {
+// ============================================================================
+// HTTP Handlers
+// ============================================================================
+
+/// Health check endpoint
+async fn health() -> &'static str {
+    "OK"
+}
+
+/// Clear the ledger file
+async fn clear_ledger(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let ledger_path = format!("{}/.ledger", state.file_dir);
+    
+    // Write empty ledger
+    let ledger = Ledger::new();
+    let ledger_json = serde_json::to_string_pretty(&ledger).unwrap();
+    fs::write(&ledger_path, ledger_json).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(serde_json::json!({
+        "status": "ledger cleared"
+    })))
+}
+
+/// Lists all files in the knowledge base
+async fn list_files(State(state): State<AppState>) -> Json<Vec<String>> {
+    let kb = state.kb.read().unwrap();
+    Json(kb.list_files())
+}
+
+/// Reads a file from the knowledge base and saves it with a .ledger file
+async fn read_file(
+    State(state): State<AppState>,
+    Path(filepath): Path<String>,
+) -> Result<String, StatusCode> {
+    let content: String;
+    let node_indices: Vec<usize>;
+    
+    {
+        let kb = state.kb.read().unwrap();
+        match kb.read_file(&filepath) {
+            Some(result) => {
+                content = result.0;
+                node_indices = result.1;
+            },
+            None => return Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    // Save file to disk
+    let file_path = format!("{}/{}", state.file_dir, filepath);
+    
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(&file_path).parent() {
+        fs::create_dir_all(parent).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    
+    fs::write(&file_path, &content).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Update the shared .ledger file
+    let ledger_path = format!("{}/.ledger", state.file_dir);
+    let mut ledger = if let Ok(ledger_content) = fs::read_to_string(&ledger_path).await {
+        serde_json::from_str::<Ledger>(&ledger_content).unwrap_or_else(|_| Ledger::new())
+    } else {
+        Ledger::new()
+    };
+    
+    ledger.add_nodes(node_indices);
+    
+    let ledger_json = serde_json::to_string_pretty(&ledger).unwrap();
+    fs::write(&ledger_path, ledger_json).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(content)
+}
+
+/// Request body for writing a file
+#[derive(Deserialize)]
+struct WriteFileRequest {
+    content: String,
+}
+
+/// Writes a file to the knowledge base, using .ledger file for reference nodes
+async fn write_file(
+    State(state): State<AppState>,
+    Path(filepath): Path<String>,
+    Json(payload): Json<WriteFileRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Read the shared .ledger file to get reference nodes
+    let ledger_path = format!("{}/.ledger", state.file_dir);
+    let reference_nodes = if let Ok(ledger_content) = fs::read_to_string(&ledger_path).await {
+        match serde_json::from_str::<Ledger>(&ledger_content) {
+            Ok(ledger) => {
+                // Convert node indices to actual nodes
+                let kb = state.kb.read().unwrap();
+                ledger
+                    .node_indices
+                    .iter()
+                    .filter_map(|idx| kb.nodes().get_index(*idx).cloned())
+                    .collect()
+            }
+            Err(_) => {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Get or create directory parent node
+    let file_idx: usize;
+    {
+        let mut kb = state.kb.write().unwrap();
+        
+        // Extract directory path from filepath
+        let dir_path = std::path::Path::new(&filepath)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        
+        let parent_idx = if dir_path.is_empty() {
+            kb.insert_directory(".")
+        } else {
+            kb.insert_directory(dir_path)
+        };
+
+        // Get current highest version
+        let version = kb.edge_count() as i32;
+        
+        // Insert the markdown
+        file_idx = kb.insert_markdown(
+            &payload.content,
+            &filepath,
+            parent_idx,
+            reference_nodes,
+            version,
+            &format!("version-{}", version),
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "file_idx": file_idx,
+    })))
+}
+
+// ============================================================================
+// Main Application
+// ============================================================================
+
+#[tokio::main]
+async fn main() {
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "liasiondb=debug,tower_http=debug,axum=trace".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Create knowledge base and populate with example data
+    let mut kb = KnowledgeBase::new();
+    
+    // Create a directory node
+    let docs_dir_idx = kb.insert_directory("docs");
+    
+    // Insert example content
+    let md1 = "# Example Document\n\nThis is some example content.";
+    kb.insert_markdown(
+        md1,
+        "example.md",
+        docs_dir_idx,
+        vec![],
+        0,
+        "version-0",
+    );
+
+    // Set up shared state
+    let file_dir = std::env::var("FILE_DIR").unwrap_or_else(|_| "./files".to_string());
+    fs::create_dir_all(&file_dir)
+        .await
+        .expect("Failed to create file directory");
+
+    let state = AppState {
+        kb: Arc::new(RwLock::new(kb)),
+        file_dir,
+    };
+
+    // Build router
+    use axum::routing::MethodRouter;
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/ledger", delete(clear_ledger))
+        .route("/files", get(list_files))
+        .route("/files/*path", MethodRouter::new().get(read_file).post(write_file))
+        .with_state(state);
+
+    // Start server
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+    
+    tracing::info!("Server listening on {}", listener.local_addr().unwrap());
+    
+    axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+fn old_main() {
     let mut kb = KnowledgeBase::new();
 
     // Create a directory node
