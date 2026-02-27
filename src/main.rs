@@ -114,7 +114,7 @@ impl KnowledgeBase {
         let file_node = Node::new(format!("FILE: {}", filename), filename.to_string());
         self.node_table.insert(file_node.clone());
         let file_idx = self.node_table.get_index_of(&file_node).unwrap();
-        
+
         // Create structural edge from parent to file
         self.edge_table
             .entry((parent_idx, file_idx))
@@ -130,14 +130,14 @@ impl KnowledgeBase {
         if content_nodes.is_empty() {
             return file_idx;
         }
-        
+
         let mut new_node_indices = Vec::new();
 
         // Insert first content node and link it from file node
         self.node_table.insert(content_nodes[0].clone());
         let first_content_idx = self.node_table.get_index_of(&content_nodes[0]).unwrap();
         new_node_indices.push(first_content_idx);
-        
+
         // Link file node to first content node
         self.edge_table
             .entry((file_idx, first_content_idx))
@@ -178,7 +178,7 @@ impl KnowledgeBase {
                     .or_insert_with(|| Edge::new(version, tag.to_string()));
             }
         }
-        
+
         file_idx
     }
 
@@ -229,6 +229,75 @@ impl KnowledgeBase {
         }
     }
 
+    /// Performs breadth-first search to find all nodes "contaminated" by a given node.
+    /// This follows the reference edges forward (from the given node to all nodes it influenced).
+    ///
+    /// # Arguments
+    /// * `start_idx` - The index of the node to start the search from
+    ///
+    /// # Returns
+    /// A vector of node indices that are contaminated (influenced) by the starting node
+    pub fn find_contaminated_nodes(&self, start_idx: usize) -> Vec<usize> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut contaminated = Vec::new();
+
+        queue.push_back(start_idx);
+        visited.insert(start_idx);
+
+        while let Some(current_idx) = queue.pop_front() {
+            contaminated.push(current_idx);
+
+            // Find all outgoing reference edges from current node
+            for ((from_idx, to_idx), _) in self
+                .ref_table
+                .range((current_idx, usize::MIN)..(current_idx + 1, usize::MIN))
+            {
+                if *from_idx == current_idx && !visited.contains(to_idx) {
+                    visited.insert(*to_idx);
+                    queue.push_back(*to_idx);
+                }
+            }
+        }
+
+        contaminated
+    }
+
+    /// Performs breadth-first search to find all nodes referenced by a given node.
+    /// This follows the reference edges backward (from the given node to all nodes that influenced it).
+    ///
+    /// # Arguments
+    /// * `start_idx` - The index of the node to start the search from
+    ///
+    /// # Returns
+    /// A vector of node indices that are referenced (influenced) the starting node
+    pub fn find_referenced_nodes(&self, start_idx: usize) -> Vec<usize> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut referenced = Vec::new();
+
+        queue.push_back(start_idx);
+        visited.insert(start_idx);
+
+        while let Some(current_idx) = queue.pop_front() {
+            referenced.push(current_idx);
+
+            // Find all incoming reference edges to current node
+            for ((from_idx, to_idx), _) in self.ref_table.iter() {
+                if *to_idx == current_idx && !visited.contains(from_idx) {
+                    visited.insert(*from_idx);
+                    queue.push_back(*from_idx);
+                }
+            }
+        }
+
+        referenced
+    }
+
     /// Returns the number of nodes in the knowledge base.
     pub fn node_count(&self) -> usize {
         self.node_table.len()
@@ -251,7 +320,7 @@ fn main() {
 
     // Create a directory node
     let docs_dir_idx = kb.insert_directory("docs");
-    
+
     // Insert multiple versions of similar content under the directory
     let md1 = "# Hi, *Saturn*! 🪐\nThis is some text\n## Another header\nMore text\n## New Header\n More texts";
     kb.insert_markdown(
@@ -265,7 +334,7 @@ fn main() {
         0,
         "version-0",
     );
-    
+
     let md2 = "# Hi, *Saturn*! 🪐\nThis is some better text\n## Another header\nMore text\n## New Header\n More texts";
     kb.insert_markdown(
         md2,
@@ -299,5 +368,33 @@ fn main() {
     kb.print_latest_path(docs_dir_idx);
 
     println!("\n=== Reference Table ===");
-    println!("{:?}", kb.ref_table)
+    println!("{:?}", kb.ref_table);
+
+    // Demonstrate BFS: Find all nodes contaminated by "it came to me in a dream"
+    println!("\n=== Nodes Contaminated by 'it came to me in a dream' ===");
+    let dream_idx = kb
+        .nodes()
+        .iter()
+        .position(|n| n.content == "it came to me in a dream")
+        .unwrap();
+    let contaminated = kb.find_contaminated_nodes(dream_idx);
+    println!("Reference node index: {}", dream_idx);
+    println!("Contaminated nodes ({} total):", contaminated.len());
+    for idx in &contaminated {
+        println!("  [{}] {:?}", idx, kb.nodes().get_index(*idx));
+    }
+
+    // Demonstrate BFS: Find all nodes referenced by a content node
+    println!("\n=== Nodes Referenced by '<p>This is some better text</p>' ===");
+    let content_idx = kb
+        .nodes()
+        .iter()
+        .position(|n| n.content == "<p>This is some better text</p>")
+        .unwrap();
+    let referenced = kb.find_referenced_nodes(content_idx);
+    println!("Content node index: {}", content_idx);
+    println!("Referenced nodes ({} total):", referenced.len());
+    for idx in &referenced {
+        println!("  [{}] {:?}", idx, kb.nodes().get_index(*idx));
+    }
 }
