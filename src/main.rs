@@ -58,49 +58,93 @@ impl KnowledgeBase {
         }
     }
 
+    /// Inserts a directory node into the knowledge base.
+    ///
+    /// # Arguments
+    /// * `directory_path` - Path of the directory (e.g., "src/components")
+    ///
+    /// # Returns
+    /// The index of the created directory node
+    pub fn insert_directory(&mut self, directory_path: &str) -> usize {
+        let dir_node = Node::new(format!("DIR: {}", directory_path), "".to_string());
+        self.node_table.insert(dir_node.clone());
+        self.node_table.get_index_of(&dir_node).unwrap()
+    }
+
+    /// Inserts a generic node into the knowledge base.
+    ///
+    /// # Arguments
+    /// * `content` - Content of the node
+    /// * `filename` - Source filename for provenance tracking
+    ///
+    /// # Returns
+    /// The index of the created node
+    pub fn insert_node(&mut self, content: &str, filename: &str) -> usize {
+        let node = Node::new(content.to_string(), filename.to_string());
+        self.node_table.insert(node.clone());
+        self.node_table.get_index_of(&node).unwrap()
+    }
+
     /// Inserts markdown content into the knowledge base.
     ///
     /// The markdown is converted to HTML and split by newlines. Each line becomes
     /// a node, and sequential nodes are connected by edges with the given version.
-    /// Origin and end markers are automatically added to track document boundaries.
+    /// A file node is created and linked to the parent node, then all content nodes
+    /// are linked sequentially starting from the file node.
     ///
     /// # Arguments
     /// * `markdown_content` - Raw markdown text to process
     /// * `filename` - Source filename for provenance tracking
+    /// * `parent_idx` - Index of the parent node (e.g., directory node)
     /// * `version` - Version number for CRDT conflict resolution (higher = newer)
     /// * `tag` - Tag to apply to all edges created from this content
+    ///
+    /// # Returns
+    /// The index of the file node created
     pub fn insert_markdown(
         &mut self,
         markdown_content: &str,
         filename: &str,
+        parent_idx: usize,
         reference_nodes: Vec<Node>,
         version: i32,
         tag: &str,
-    ) {
-        // Prepend origin tag and append end tag
-        let tagged_content = format!(
-            "<ORIGIN {}>\n{}\n<END {}>",
-            filename, markdown_content, filename
-        );
+    ) -> usize {
+        // Create file node and link it to parent
+        let file_node = Node::new(format!("FILE: {}", filename), filename.to_string());
+        self.node_table.insert(file_node.clone());
+        let file_idx = self.node_table.get_index_of(&file_node).unwrap();
+        
+        // Create structural edge from parent to file
+        self.edge_table
+            .entry((parent_idx, file_idx))
+            .or_insert_with(|| Edge::new(version, tag.to_string()));
 
-        let html = markdown::to_html(&tagged_content);
-        let nodes: Vec<Node> = html
+        let html = markdown::to_html(markdown_content);
+        let content_nodes: Vec<Node> = html
             .split('\n')
+            .filter(|line| !line.is_empty())
             .map(|line| Node::new(line.to_string(), filename.to_string()))
             .collect();
 
-        if nodes.is_empty() {
-            return;
+        if content_nodes.is_empty() {
+            return file_idx;
         }
+        
         let mut new_node_indices = Vec::new();
 
-        // Insert first node
-        if self.node_table.insert(nodes[0].clone()) {
-            new_node_indices.push(self.node_table.get_index_of(&nodes[0]).unwrap())
-        };
+        // Insert first content node and link it from file node
+        self.node_table.insert(content_nodes[0].clone());
+        let first_content_idx = self.node_table.get_index_of(&content_nodes[0]).unwrap();
+        new_node_indices.push(first_content_idx);
+        
+        // Link file node to first content node
+        self.edge_table
+            .entry((file_idx, first_content_idx))
+            .or_insert_with(|| Edge::new(version, tag.to_string()));
 
         // Insert remaining nodes and create edges
-        for window in nodes.windows(2) {
+        for window in content_nodes.windows(2) {
             let from_node = &window[0];
             let to_node = &window[1];
 
@@ -134,6 +178,8 @@ impl KnowledgeBase {
                     .or_insert_with(|| Edge::new(version, tag.to_string()));
             }
         }
+        
+        file_idx
     }
 
     /// Returns an immutable reference to the node table.
@@ -192,35 +238,6 @@ impl KnowledgeBase {
     pub fn edge_count(&self) -> usize {
         self.edge_table.len()
     }
-
-    /// Finds the index of the origin node for a given filename.
-    /// Returns None if no origin node is found for that filename.
-    pub fn find_origin_node(&self, filename: &str) -> Option<usize> {
-        let origin_marker = format!("&lt;ORIGIN {}&gt;", filename);
-        self.node_table
-            .iter()
-            .position(|node| node.content == origin_marker && node.filename == filename)
-    }
-
-    /// Traverses from the origin node of a given filename.
-    /// Returns None if the origin node cannot be found.
-    pub fn traverse_from_origin(&self, filename: &str) -> Option<Vec<usize>> {
-        self.find_origin_node(filename)
-            .map(|idx| self.traverse_latest_path(idx))
-    }
-
-    /// Pretty prints the traversal path starting from the origin node of a filename.
-    pub fn print_from_origin(&self, filename: &str) {
-        match self.find_origin_node(filename) {
-            Some(origin_idx) => {
-                println!("Starting traversal from origin node of '{}':", filename);
-                self.print_latest_path(origin_idx);
-            }
-            None => {
-                println!("No origin node found for filename '{}'", filename);
-            }
-        }
-    }
 }
 
 impl Default for KnowledgeBase {
@@ -232,11 +249,15 @@ impl Default for KnowledgeBase {
 fn main() {
     let mut kb = KnowledgeBase::new();
 
-    // Insert multiple versions of similar content
+    // Create a directory node
+    let docs_dir_idx = kb.insert_directory("docs");
+    
+    // Insert multiple versions of similar content under the directory
     let md1 = "# Hi, *Saturn*! 🪐\nThis is some text\n## Another header\nMore text\n## New Header\n More texts";
     kb.insert_markdown(
         md1,
         "test.md",
+        docs_dir_idx,
         vec![Node::new(
             "it came to me in a dream".to_string(),
             "".to_string(),
@@ -244,10 +265,12 @@ fn main() {
         0,
         "version-0",
     );
+    
     let md2 = "# Hi, *Saturn*! 🪐\nThis is some better text\n## Another header\nMore text\n## New Header\n More texts";
     kb.insert_markdown(
         md2,
         "test.md",
+        docs_dir_idx,
         vec![Node::new(
             "I actually read this I swear".to_string(),
             "".to_string(),
@@ -271,9 +294,10 @@ fn main() {
         );
     }
 
-    // Traverse and print the latest path from origin
-    println!("\n=== Latest Path Traversal (from origin) ===");
-    kb.print_from_origin("test.md");
+    // Traverse and print the latest path from directory
+    println!("\n=== Latest Path Traversal (from directory) ===");
+    kb.print_latest_path(docs_dir_idx);
 
+    println!("\n=== Reference Table ===");
     println!("{:?}", kb.ref_table)
 }
