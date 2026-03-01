@@ -2,9 +2,13 @@ use datafusion::prelude::*;
 use std::time::Instant;
 use std::hash::BuildHasher;
 use rapidhash::fast::SeedableState;
+use std::collections::BTreeSet;
+use tokio::sync::RwLock;
 
 struct KnowledgeBase {
     ctx: SessionContext,
+    node_index: RwLock<BTreeSet<u64>>,
+    edge_index: RwLock<BTreeSet<(u64, u64)>>,
 }
 
 impl KnowledgeBase {
@@ -41,7 +45,11 @@ impl KnowledgeBase {
         .collect()
         .await?;
 
-        Ok(Self { ctx })
+        Ok(Self { 
+            ctx,
+            node_index: RwLock::new(BTreeSet::new()),
+            edge_index: RwLock::new(BTreeSet::new()),
+        })
     }
 
     async fn unique_insert(&self, 
@@ -49,49 +57,93 @@ impl KnowledgeBase {
         doc: &str,
         org: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Compute all hashes upfront
         let hasher = SeedableState::fixed();
-        
-        // Build VALUES clause for nodes
-        let node_values: String = content_vec
-            .iter()
-            .map(|c| {
-                let hash = hasher.hash_one(format!("{c}_{doc}_{org}"));
-                format!("('{hash}','{c}','{doc}','{org}', now())")
-            })
-            .collect::<Vec<String>>()
-            .join(",");
-
-        // Build VALUES clause for edges
         let hash_vec: Vec<u64> = content_vec
             .iter()
             .map(|i| hasher.hash_one(format!("{i}_{doc}_{org}")))
             .collect();
         
-        let edge_values: String = hash_vec
+        // Filter new nodes
+        let node_idx = self.node_index.read().await;
+        let new_nodes: Vec<(usize, &str, u64)> = content_vec
+            .iter()
+            .zip(hash_vec.iter())
+            .enumerate()
+            .filter(|(_, (_, hash))| !node_idx.contains(hash))
+            .map(|(i, (content, hash))| (i, *content, *hash))
+            .collect();
+        drop(node_idx);
+
+        // Filter new edges
+        let edge_idx = self.edge_index.read().await;
+        let new_edges: Vec<(u64, u64)> = hash_vec
             .windows(2)
-            .map(|w| format!("('{0}_{1}', '{0}', '{1}', now())", w[0], w[1]))
+            .filter(|w| !edge_idx.contains(&(w[0], w[1])))
+            .map(|w| (w[0], w[1]))
+            .collect();
+        drop(edge_idx);
+
+        // Batch insert new nodes
+        if !new_nodes.is_empty() {
+            self.batch_insert_nodes(&new_nodes, doc, org).await?;
+            
+            // Update node index
+            let mut node_idx = self.node_index.write().await;
+            for (_, _, hash) in &new_nodes {
+                node_idx.insert(*hash);
+            }
+        }
+
+        // Batch insert new edges
+        if !new_edges.is_empty() {
+            self.batch_insert_edges(&new_edges).await?;
+            
+            // Update edge index
+            let mut edge_idx = self.edge_index.write().await;
+            for (o, d) in &new_edges {
+                edge_idx.insert((*o, *d));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn batch_insert_nodes(
+        &self,
+        nodes: &[(usize, &str, u64)],
+        doc: &str,
+        org: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let insert_elements: String = nodes
+            .iter()
+            .map(|(_, content, hash)| format!("('{hash}','{content}','{doc}','{org}', now())"))
             .collect::<Vec<String>>()
             .join(",");
 
-        // Single transaction-like batch
-        let query = format!(r#"
-            INSERT INTO kb.nodes 
-            SELECT * FROM (VALUES {node_values}) AS new_nodes(id, content, doc, org, time)
-            WHERE id NOT IN (SELECT id FROM kb.nodes)
-        "#);
-        
+        let query = format!(
+            r#"INSERT INTO kb.nodes VALUES {insert_elements}"#
+        );
+
         self.ctx.sql(&query).await?.collect().await?;
+        Ok(())
+    }
 
-        if !edge_values.is_empty() {
-            let query = format!(r#"
-                INSERT INTO kb.edges 
-                SELECT * FROM (VALUES {edge_values}) AS new_edges(id, o_id, d_id, time)
-                WHERE id NOT IN (SELECT id FROM kb.edges)
-            "#);
-            
-            self.ctx.sql(&query).await?.collect().await?;
-        }
+    async fn batch_insert_edges(
+        &self,
+        edges: &[(u64, u64)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let insert_elements: String = edges
+            .iter()
+            .map(|(o, d)| format!("('{o}_{d}', '{o}', '{d}', now())"))
+            .collect::<Vec<String>>()
+            .join(",");
 
+        let query = format!(
+            r#"INSERT INTO kb.edges VALUES {insert_elements}"#
+        );
+
+        self.ctx.sql(&query).await?.collect().await?;
         Ok(())
     }
 

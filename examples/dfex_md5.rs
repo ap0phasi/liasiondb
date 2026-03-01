@@ -1,6 +1,4 @@
 use datafusion::prelude::*;
-use datafusion::arrow::array::{Array, StringViewArray};
-use datafusion::common::HashSet;
 use std::time::Instant;
 
 struct KnowledgeBase {
@@ -18,7 +16,7 @@ impl KnowledgeBase {
 
         ctx.sql(r#"
             CREATE TABLE kb.nodes (
-                id VARCHAR,
+                id VARCHAR(64),
                 content VARCHAR,
                 doc VARCHAR,
                 org VARCHAR,
@@ -31,9 +29,9 @@ impl KnowledgeBase {
 
         ctx.sql(r#"
             CREATE TABLE kb.edges (
-                id VARCHAR,
-                o_id VARCHAR,
-                d_id VARCHAR,
+                id VARCHAR(129),
+                o_id VARCHAR(64),
+                d_id VARCHAR(64),
                 time TIMESTAMP
             )
         "#)
@@ -44,10 +42,52 @@ impl KnowledgeBase {
         Ok(Self { ctx })
     }
 
-    async fn recursive_trace_latest(&self, o_node: &str, doc: &str, org: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn unique_insert(&self, 
+        content_vec: Vec<&str>,
+        doc: &str,
+        org: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {   
+        // Build VALUES clause for nodes
+        let node_values: String = content_vec
+            .iter()
+            .map(|c| {
+                format!("(md5('{c}_{doc}_{org}'),'{c}','{doc}','{org}', now())")
+            })
+            .collect::<Vec<String>>()
+            .join(",");
+        
+        let edge_values: String = content_vec
+            .windows(2)
+            .map(|w| format!("(md5('{0}_{doc}_{org}__{1}_{doc}_{org}'), md5('{0}_{doc}_{org}'), md5('{1}_{doc}_{org}'), now())", w[0], w[1]))
+            .collect::<Vec<String>>()
+            .join(",");
+
+        // Single transaction-like batch
+        let query = format!(r#"
+            INSERT INTO kb.nodes 
+            SELECT * FROM (VALUES {node_values}) AS new_nodes(id, content, doc, org, time)
+            WHERE id NOT IN (SELECT id FROM kb.nodes)
+        "#);
+        
+        self.ctx.sql(&query).await?.collect().await?;
+
+        if !edge_values.is_empty() {
+            let query = format!(r#"
+                INSERT INTO kb.edges 
+                SELECT * FROM (VALUES {edge_values}) AS new_edges(id, o_id, d_id, time)
+                WHERE id NOT IN (SELECT id FROM kb.edges)
+            "#);
+            
+            self.ctx.sql(&query).await?.collect().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn recursive_trace_latest(&self, o_node_str: &str, doc: &str, org: &str) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.ctx.sql(&format!(r#"
             WITH RECURSIVE nodes(node_1, depth) AS (
-                SELECT md5('{o_node}_{doc}_{org}') as node_1, 0 as depth
+                SELECT md5('{o_node_str}_{doc}_{org}') as node_1, 0 as depth
                 UNION ALL
                 SELECT subq.d_id as node_1, nodes.depth + 1 as depth
                 FROM nodes
@@ -62,99 +102,10 @@ impl KnowledgeBase {
         println!("{:?}", result);
         Ok(())
     }
-
-    async fn unique_edge_insert(&self, 
-        content_vec: Vec<&str>,
-        doc: &str,
-        org: &str,
-    )-> Result<(),Box<dyn std::error::Error>>{
-        let insert_edges = content_vec
-            .windows(2)
-            .map(|c| format!("(md5('{0}_{doc}_{org}_{1}_{doc}_{org}'), md5('{0}_{doc}_{org}') , md5('{1}_{doc}_{org}'), now())", c[0], c[1]))
-            .collect::<Vec<String>>()
-            .join(",");
-
-        let query = format!(
-            r#"
-            WITH new_edges (id, o_id, d_id, time) AS (
-                VALUES {insert_edges}
-            )
-            SELECT new_edges.* 
-            FROM new_edges
-            LEFT JOIN kb.edges k ON new_edges.id = k.id
-            WHERE k.id IS NULL
-            "#
-        );
-
-        let batches = self.ctx.sql(&query).await?.collect().await?;
-
-        if !batches.is_empty() {
-            for batch in batches {
-            let temp_table = "fresh_nodes_temp";
-            self.ctx.register_batch(temp_table, batch)?;
-
-            self.ctx
-                .sql(&format!("INSERT INTO kb.edges SELECT * FROM {}", temp_table))
-                .await?
-                .collect()
-                .await?;
-
-            self.ctx.deregister_table(temp_table)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn unique_node_insert(
-        &self,
-        content_vec: Vec<&str>,
-        doc: &str,
-        org: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let insert_elements: String = content_vec
-            .iter()
-            .map(|c| format!("(md5('{c}_{doc}_{org}'),'{c}','{doc}','{org}', now())"))
-            .collect::<Vec<String>>()
-            .join(",");
-
-        // Get the fresh nodes as RecordBatches
-        let query = format!(
-            r#"
-            WITH new_nodes (id, content, doc, org, time) AS (
-                VALUES {insert_elements}
-            )
-            SELECT new_nodes.* 
-            FROM new_nodes 
-            LEFT JOIN kb.nodes k ON new_nodes.id = k.id
-            WHERE k.id IS NULL
-            "#
-        );
-
-        let batches = self.ctx.sql(&query).await?.collect().await?;
-
-        if !batches.is_empty() {
-            for batch in batches {
-            let temp_table = "fresh_nodes_temp";
-            self.ctx.register_batch(temp_table, batch)?;
-
-            self.ctx
-                .sql(&format!("INSERT INTO kb.nodes SELECT * FROM {}", temp_table))
-                .await?
-                .collect()
-                .await?;
-
-            self.ctx.deregister_table(temp_table)?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
     let now = Instant::now();
 
     let kb = KnowledgeBase::new().await?;
@@ -162,16 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a header", "This is text", "## This is another header"];
     let doc = "doc.md";
     let org = "myorg";
-    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
-    kb.unique_edge_insert(content_vec, doc, org).await?;
+    kb.unique_insert(content_vec, doc, org).await?;
 
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a newer header", "This is text", "## This is another header"];
-    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
-    kb.unique_edge_insert(content_vec, doc, org).await?;
+    kb.unique_insert(content_vec, doc, org).await?;
 
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a header", "This is text", "## This is another header", "This is new stuff", "### A bunch of new","stuff"];
-    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
-    kb.unique_edge_insert(content_vec, doc, org).await?;
+    kb.unique_insert(content_vec, doc, org).await?;
 
     let query_res = kb.ctx.sql("SELECT * FROM kb.nodes").await?.collect().await?;
     println!("------Final Nodes-----\n{:?}", query_res);
@@ -179,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_res = kb.ctx.sql("SELECT * FROM kb.edges").await?.collect().await?;
     println!("------Final Edges-----\n{:?}", query_res);
 
+    println!("----Full Trace----");
     kb.recursive_trace_latest("<ORIGIN_doc.md>", doc, org).await?;
 
     let elapsed_time = now.elapsed();
