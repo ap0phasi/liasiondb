@@ -1,10 +1,10 @@
 use datafusion::prelude::*;
+use datafusion::arrow::array::{Array, StringViewArray};
+use datafusion::common::HashSet;
 use std::time::Instant;
-use std::hash::BuildHasher;
-use rapidhash::fast::SeedableState;
 
 struct KnowledgeBase {
-    ctx: SessionContext
+    ctx: SessionContext,
 }
 
 impl KnowledgeBase {
@@ -18,7 +18,7 @@ impl KnowledgeBase {
 
         ctx.sql(r#"
             CREATE TABLE kb.nodes (
-                id VARCHAR(64),
+                id VARCHAR,
                 content VARCHAR,
                 doc VARCHAR,
                 org VARCHAR,
@@ -31,9 +31,9 @@ impl KnowledgeBase {
 
         ctx.sql(r#"
             CREATE TABLE kb.edges (
-                id VARCHAR(129),
-                o_id VARCHAR(64),
-                d_id VARCHAR(64),
+                id VARCHAR,
+                o_id VARCHAR,
+                d_id VARCHAR,
                 time TIMESTAMP
             )
         "#)
@@ -41,28 +41,13 @@ impl KnowledgeBase {
         .collect()
         .await?;
 
-        Ok(Self { ctx})
+        Ok(Self { ctx })
     }
 
-    async fn unique_insert(&self, 
-        content_vec: Vec<&str>,
-        doc: &str,
-        org: &str,
-    
-    )-> Result<(),Box<dyn std::error::Error>>{
-        let hasher = SeedableState::fixed();
-        let hash_vec = content_vec.iter().map(|i| hasher.hash_one(format!("{i}_{doc}_{org}"))).collect::<Vec<u64>>();
-        self.unique_node_insert(content_vec, hash_vec.clone(), doc, org).await?;
-        self.unique_edge_insert(hash_vec).await?;
-        Ok(())
-    }
-
-    async fn recursive_trace_latest(&self, o_node_str: &str, doc: &str, org: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let hasher = SeedableState::fixed();
-        let o_node = hasher.hash_one(format!("{o_node_str}_{doc}_{org}"));
+    async fn recursive_trace_latest(&self, o_node: &str, doc: &str, org: &str) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.ctx.sql(&format!(r#"
             WITH RECURSIVE nodes(node_1, depth) AS (
-                SELECT '{o_node}' as node_1, 0 as depth
+                SELECT md5('{o_node}_{doc}_{org}') as node_1, 0 as depth
                 UNION ALL
                 SELECT subq.d_id as node_1, nodes.depth + 1 as depth
                 FROM nodes
@@ -78,10 +63,14 @@ impl KnowledgeBase {
         Ok(())
     }
 
-    async fn unique_edge_insert(&self, hash_vec: Vec<u64>)-> Result<(),Box<dyn std::error::Error>>{
-        let insert_edges = hash_vec
+    async fn unique_edge_insert(&self, 
+        content_vec: Vec<&str>,
+        doc: &str,
+        org: &str,
+    )-> Result<(),Box<dyn std::error::Error>>{
+        let insert_edges = content_vec
             .windows(2)
-            .map(|c| format!("('{0}_{1}', '{0}' , '{1}', now())", c[0], c[1]))
+            .map(|c| format!("(md5('{0}_{doc}_{org}_{1}_{doc}_{org}'), md5('{0}_{doc}_{org}') , md5('{1}_{doc}_{org}'), now())", c[0], c[1]))
             .collect::<Vec<String>>()
             .join(",");
 
@@ -120,14 +109,12 @@ impl KnowledgeBase {
     async fn unique_node_insert(
         &self,
         content_vec: Vec<&str>,
-        hash_vec: Vec<u64>,
         doc: &str,
         org: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let insert_elements: String = content_vec
-            .into_iter()
-            .zip(hash_vec.into_iter())
-            .map(move |(c, d)| format!("('{d}','{c}','{doc}','{org}', now())"))
+            .iter()
+            .map(|c| format!("(md5('{c}_{doc}_{org}'),'{c}','{doc}','{org}', now())"))
             .collect::<Vec<String>>()
             .join(",");
 
@@ -175,13 +162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a header", "This is text", "## This is another header"];
     let doc = "doc.md";
     let org = "myorg";
-    kb.unique_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_edge_insert(content_vec, doc, org).await?;
 
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a newer header", "This is text", "## This is another header"];
-    kb.unique_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_edge_insert(content_vec, doc, org).await?;
 
     let content_vec: Vec<&str> = vec!["<ORIGIN_doc.md>","# This is a header", "This is text", "## This is another header", "This is new stuff", "### A bunch of new","stuff"];
-    kb.unique_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_node_insert(content_vec.clone(), doc, org).await?;
+    kb.unique_edge_insert(content_vec, doc, org).await?;
 
     let query_res = kb.ctx.sql("SELECT * FROM kb.nodes").await?.collect().await?;
     println!("------Final Nodes-----\n{:?}", query_res);
@@ -189,7 +179,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_res = kb.ctx.sql("SELECT * FROM kb.edges").await?.collect().await?;
     println!("------Final Edges-----\n{:?}", query_res);
 
-    println!("----Full Trace----");
     kb.recursive_trace_latest("<ORIGIN_doc.md>", doc, org).await?;
 
     let elapsed_time = now.elapsed();
